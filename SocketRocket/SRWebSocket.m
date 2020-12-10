@@ -186,14 +186,13 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
 - (instancetype)initWithURLRequest:(NSURLRequest *)request protocols:(NSArray<NSString *> *)protocols allowsUntrustedSSLCertificates:(BOOL)allowsUntrustedSSLCertificates
 {
     SRSecurityPolicy *securityPolicy;
-    BOOL certificateChainValidationEnabled = !allowsUntrustedSSLCertificates;
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated"
-
-    securityPolicy = [[SRSecurityPolicy alloc] initWithCertificateChainValidationEnabled:certificateChainValidationEnabled];
-
-#pragma clang diagnostic pop
+    NSArray *pinnedCertificates = request.SR_SSLPinnedCertificates;
+    if (pinnedCertificates) {
+        securityPolicy = [SRSecurityPolicy pinnningPolicyWithCertificates:pinnedCertificates];
+    } else {
+        BOOL certificateChainValidationEnabled = !allowsUntrustedSSLCertificates;
+        securityPolicy = [[SRSecurityPolicy alloc] initWithCertificateChainValidationEnabled:certificateChainValidationEnabled];
+    }
 
     return [self initWithURLRequest:request protocols:protocols securityPolicy:securityPolicy];
 }
@@ -205,12 +204,7 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
 
 - (instancetype)initWithURLRequest:(NSURLRequest *)request protocols:(NSArray<NSString *> *)protocols
 {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated"
-
     return [self initWithURLRequest:request protocols:protocols allowsUntrustedSSLCertificates:NO];
-
-#pragma clang diagnostic pop
 }
 
 - (instancetype)initWithURLRequest:(NSURLRequest *)request
@@ -225,12 +219,7 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
 
 - (instancetype)initWithURL:(NSURL *)url protocols:(NSArray<NSString *> *)protocols;
 {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated"
-
     return [self initWithURL:url protocols:protocols allowsUntrustedSSLCertificates:NO];
-
-#pragma clang diagnostic pop
 }
 
 - (instancetype)initWithURL:(NSURL *)url securityPolicy:(SRSecurityPolicy *)securityPolicy
@@ -256,12 +245,12 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
 
 - (void)dealloc
 {
-    _inputStream.delegate = nil;
-    _outputStream.delegate = nil;
-
     [_inputStream close];
     [_outputStream close];
 
+    _inputStream.delegate = nil;
+    _outputStream.delegate = nil;
+    
     if (_receivedHTTPHeaders) {
         CFRelease(_receivedHTTPHeaders);
         _receivedHTTPHeaders = NULL;
@@ -309,7 +298,6 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
 ///--------------------------------------
 #pragma mark - Open / Close
 ///--------------------------------------
-
 - (void)open
 {
     assert(_url);
@@ -319,7 +307,7 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
 
     if (_urlRequest.timeoutInterval > 0) {
         dispatch_time_t popTime = dispatch_time(DISPATCH_TIME_NOW, (int64_t)(_urlRequest.timeoutInterval * NSEC_PER_SEC));
-        dispatch_after(popTime, dispatch_get_main_queue(), ^{
+        dispatch_after(popTime, _workQueue, ^{
             if (self.readyState == SR_CONNECTING) {
                 NSError *error = SRErrorWithDomainCodeDescription(NSURLErrorDomain, NSURLErrorTimedOut, @"Timed out connecting to server.");
                 [self _failWithError:error];
@@ -429,15 +417,16 @@ NSString *const SRHTTPResponseErrorKey = @"HTTPResponseStatusCode";
     if (_receivedHTTPHeaders == NULL) {
         _receivedHTTPHeaders = CFHTTPMessageCreateEmpty(NULL, NO);
     }
-
+    __weak __typeof(self) wself = self;
     [self _readUntilHeaderCompleteWithCallback:^(SRWebSocket *socket,  NSData *data) {
-        CFHTTPMessageAppendBytes(_receivedHTTPHeaders, (const UInt8 *)data.bytes, data.length);
-
-        if (CFHTTPMessageIsHeaderComplete(_receivedHTTPHeaders)) {
-            SRDebugLog(@"Finished reading headers %@", CFBridgingRelease(CFHTTPMessageCopyAllHeaderFields(_receivedHTTPHeaders)));
-            [self _HTTPHeadersDidFinish];
+        __strong typeof(wself) sself = wself;
+        if (sself == nil) return;
+        CFHTTPMessageAppendBytes(sself.receivedHTTPHeaders, (const UInt8 *)data.bytes, data.length);
+        if (CFHTTPMessageIsHeaderComplete(sself.receivedHTTPHeaders)) {
+            SRDebugLog(@"Finished reading headers %@", CFBridgingRelease(CFHTTPMessageCopyAllHeaderFields(sself.receivedHTTPHeaders)));
+            [sself _HTTPHeadersDidFinish];
         } else {
-            [self _readHTTPHeader];
+            [sself _readHTTPHeader];
         }
     }];
 }
@@ -1083,17 +1072,9 @@ static const uint8_t SRPayloadLenMask   = 0x7F;
          _inputStream.streamStatus != NSStreamStatusClosed) &&
         !_sentClose) {
         _sentClose = YES;
-
-        @synchronized(self) {
-            [_outputStream close];
-            [_inputStream close];
-
-
-            for (NSArray *runLoop in [_scheduledRunloops copy]) {
-                [self unscheduleFromRunLoop:[runLoop objectAtIndex:0] forMode:[runLoop objectAtIndex:1]];
-            }
-        }
-
+        
+        [self _scheduleCleanup];
+        
         if (!_failed) {
             [self.delegateController performDelegateBlock:^(id<SRWebSocketDelegate>  _Nullable delegate, SRDelegateAvailableMethods availableMethods) {
                 if (availableMethods.didCloseWithCode) {
@@ -1101,8 +1082,6 @@ static const uint8_t SRPayloadLenMask   = 0x7F;
                 }
             }];
         }
-
-        [self _scheduleCleanup];
     }
 }
 
@@ -1137,32 +1116,41 @@ static const uint8_t SRPayloadLenMask   = 0x7F;
         }
 
         _cleanupScheduled = YES;
+    }
+   
+    // Cleanup NSStream delegate's in the same RunLoop used by the streams themselves:
+    // This way we'll prevent race conditions between handleEvent and SRWebsocket's dealloc
+    NSTimer *timer = [NSTimer timerWithTimeInterval:(0.0f) target:self selector:@selector(_cleanupSelfReference:) userInfo:nil repeats:NO];
+    [[NSRunLoop SR_networkRunLoop] addTimer:timer forMode:NSDefaultRunLoopMode];
+}
 
-        // Cleanup NSStream delegate's in the same RunLoop used by the streams themselves:
-        // This way we'll prevent race conditions between handleEvent and SRWebsocket's dealloc
-        NSTimer *timer = [NSTimer timerWithTimeInterval:(0.0f) target:self selector:@selector(_cleanupSelfReference:) userInfo:nil repeats:NO];
-        [[NSRunLoop SR_networkRunLoop] addTimer:timer forMode:NSDefaultRunLoopMode];
+- (void)removeAllFromRunLoops {
+    for (NSArray *runLoop in [_scheduledRunloops copy]) {
+        [self unscheduleFromRunLoop:[runLoop objectAtIndex:0] forMode:[runLoop objectAtIndex:1]];
     }
 }
 
 - (void)_cleanupSelfReference:(NSTimer *)timer
 {
-    @synchronized(self) {
-        // Nuke NSStream delegate's
-        _inputStream.delegate = nil;
-        _outputStream.delegate = nil;
+    [_inputStream close];
+    [_outputStream close];
+    
+    [self removeAllFromRunLoops];
+    
+    _inputStream.delegate = nil;
+    _outputStream.delegate = nil;
+    
+    //this is done to make sure that last request in the loop, is for setting _selfRetain to nil
+    NSTimer *selfRefTimer = [NSTimer timerWithTimeInterval:(0.0f) target:self selector:@selector(releaseSelfRef) userInfo:nil repeats:NO];
+    [[NSRunLoop SR_networkRunLoop] addTimer:selfRefTimer forMode:NSDefaultRunLoopMode];
+}
 
-        // Remove the streams, right now, from the networkRunLoop
-        [_inputStream close];
-        [_outputStream close];
-    }
-
-    // Cleanup selfRetain in the same GCD queue as usual
+- (void)releaseSelfRef {
+    
     dispatch_async(_workQueue, ^{
         _selfRetain = nil;
     });
 }
-
 
 static const char CRLFCRLFBytes[] = {'\r', '\n', '\r', '\n'};
 
@@ -1421,7 +1409,7 @@ static const size_t SRFrameHeaderOverhead = 32;
             return;
         }
         dispatch_async(_workQueue, ^{
-            [self didConnect];
+            [wself didConnect];
         });
     }
     dispatch_async(_workQueue, ^{
